@@ -19,6 +19,7 @@ import (
 
 	"telecloud/config"
 	"telecloud/database"
+	"telecloud/utils"
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
@@ -146,14 +147,25 @@ type DBSessionStorage struct {
 
 func (s *DBSessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
 	data, err := database.GetTGSession(s.SessionID)
-	if err != nil {
+	if err != nil || len(data) == 0 {
 		return nil, session.ErrNotFound
 	}
-	return data, nil
+	// Decrypt blobs that were stored with EncryptAEAD. Legacy plaintext blobs
+	// (pre-encryption migration) are returned as-is so the gotd session loader
+	// can read them — the auto-migration will re-encrypt them on next store.
+	plain, err := utils.DecryptAEAD(data)
+	if err != nil {
+		return data, nil
+	}
+	return plain, nil
 }
 
 func (s *DBSessionStorage) StoreSession(ctx context.Context, data []byte) error {
-	return database.SetTGSession(s.SessionID, data)
+	enc, err := utils.EncryptAEAD(data)
+	if err != nil {
+		return err
+	}
+	return database.SetTGSession(s.SessionID, enc)
 }
 
 

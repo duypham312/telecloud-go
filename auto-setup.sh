@@ -93,6 +93,34 @@ pkg_install() {
     esac
 }
 
+# Hàm xác thực SHA256 của file. Trả về 0 nếu khớp, 1 nếu không.
+# Sử dụng: verify_sha256 <file_path> <expected_sha256_hex>
+verify_sha256() {
+    local file="$1"
+    local expected="$2"
+    if [ -z "$expected" ]; then
+        echo "[!] Không có giá trị SHA256 mong đợi cho $file — bỏ qua kiểm tra."
+        return 1
+    fi
+    local actual=""
+    if command -v sha256sum &>/dev/null; then
+        actual=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        echo "[!] Không tìm thấy sha256sum hoặc shasum — không thể xác thực checksum."
+        return 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+        echo "[!] CHECKSUM SAI cho $file"
+        echo "    Mong đợi: $expected"
+        echo "    Thực tế : $actual"
+        return 1
+    fi
+    echo "[✓] Đã xác thực SHA256 cho $(basename "$file")"
+    return 0
+}
+
 # Hàm tải file hỗ trợ fallback wget/curl và retry
 download_file() {
     local url="$1"
@@ -332,6 +360,31 @@ download_telecloud() {
 
     echo "[+] Đang tải phiên bản $VERSION..."
     download_file "$URL" telecloud.tar.gz || return 1
+
+    # Xác thực checksums.txt (do GoReleaser sinh tự động)
+    CHECKSUMS_URL=$(echo "$API_DATA" | jq -r '.assets[] | select(.name == "checksums.txt") | .browser_download_url' | head -n 1)
+    if [ -n "$CHECKSUMS_URL" ] && [ "$CHECKSUMS_URL" != "null" ]; then
+        download_file "$CHECKSUMS_URL" telecloud-checksums.txt || {
+            echo "[!] Không tải được checksums.txt — TỪ CHỐI cài để tránh binary giả mạo."
+            rm -f telecloud.tar.gz
+            return 1
+        }
+        EXPECTED_SHA=$(grep "$(basename "$URL")" telecloud-checksums.txt | awk '{print $1}' | head -n 1)
+        if ! verify_sha256 telecloud.tar.gz "$EXPECTED_SHA"; then
+            echo "[!] TỪ CHỐI cài đặt do checksum không khớp."
+            rm -f telecloud.tar.gz telecloud-checksums.txt
+            return 1
+        fi
+        rm -f telecloud-checksums.txt
+    else
+        echo "[!] CẢNH BÁO: Release $VERSION không có checksums.txt — không thể xác thực binary."
+        read -p "[?] Vẫn tiếp tục cài? (y/n): " confirm_no_sum
+        if [ "$confirm_no_sum" != "y" ]; then
+            rm -f telecloud.tar.gz
+            return 1
+        fi
+    fi
+
     mkdir -p "$BASE_DIR"
     tar -xzf telecloud.tar.gz -C "$BASE_DIR" || { echo "[!] Giải nén thất bại!"; return 1; }
 
@@ -348,6 +401,19 @@ download_telecloud() {
 # =============================
 # 4. CẤU HÌNH .ENV
 # =============================
+gen_random_hex() {
+    local len="${1:-32}"
+    if command -v openssl &>/dev/null; then
+        openssl rand -hex "$len"
+    elif [ -r /dev/urandom ]; then
+        LC_ALL=C tr -dc '0-9a-f' < /dev/urandom | head -c $((len * 2))
+        echo
+    else
+        echo "[!] Không tìm thấy openssl hoặc /dev/urandom để sinh khóa ngẫu nhiên!"
+        return 1
+    fi
+}
+
 create_env() {
     if [ ! -f "$BASE_DIR/.env" ]; then
         echo "[+] Thiết lập cấu hình .env..."
@@ -355,10 +421,16 @@ create_env() {
         read -p "Cổng PORT [Mặc định 8091]: " PORT
         PORT=${PORT:-8091}
 
+        MASTER_KEY=$(gen_random_hex 32) || return 1
+        SETUP_TOKEN=$(gen_random_hex 16) || return 1
+
         cat > "$BASE_DIR/.env" <<EOF
 PORT=$PORT
+LISTEN_ADDR=127.0.0.1
+TELECLOUD_MASTER_KEY=$MASTER_KEY
+TELECLOUD_SETUP_TOKEN=$SETUP_TOKEN
 EOF
-        
+
         if command -v ffmpeg &> /dev/null; then
             echo "FFMPEG_PATH=ffmpeg" >> "$BASE_DIR/.env"
         else
@@ -379,6 +451,17 @@ EOF
 
         chmod 600 "$BASE_DIR/.env"
         echo "✅ Đã lưu cấu hình .env"
+        echo ""
+        echo "=================================================================="
+        echo "⚠️  HÃY SAO LƯU MASTER KEY DƯỚI ĐÂY VÀO TRÌNH QUẢN LÝ MẬT KHẨU!"
+        echo "    Mất key này = mất quyền giải mã Telegram session và secrets."
+        echo "    TELECLOUD_MASTER_KEY=$MASTER_KEY"
+        echo "------------------------------------------------------------------"
+        echo "🔑 Mở trình duyệt tại:"
+        echo "    http://127.0.0.1:$PORT/setup?token=$SETUP_TOKEN"
+        echo "    (token chỉ dùng 1 lần cho đến khi admin được tạo)"
+        echo "=================================================================="
+        echo ""
     fi
 }
 
@@ -424,6 +507,20 @@ create_run_scripts() {
 
     # Tạo systemd service cho Linux có systemd
     if [ "$OS_TYPE" == "linux" ] && command -v systemctl &>/dev/null; then
+        # Tạo user 'telecloud' không-shell để chạy service (sandbox + bảo mật)
+        if ! getent passwd telecloud >/dev/null 2>&1; then
+            useradd --system --no-create-home --home-dir "$BASE_DIR" --shell /usr/sbin/nologin telecloud \
+                || useradd --system --no-create-home --home-dir "$BASE_DIR" --shell /bin/false telecloud \
+                || echo "[!] Không tạo được user 'telecloud' — service sẽ chạy với DynamicUser."
+        fi
+        # Đảm bảo data/log/temp của BASE_DIR thuộc về user telecloud (nếu tạo thành công)
+        if getent passwd telecloud >/dev/null 2>&1; then
+            chown -R telecloud:telecloud "$BASE_DIR" 2>/dev/null || true
+            SERVICE_USER_LINES=$'User=telecloud\nGroup=telecloud'
+        else
+            SERVICE_USER_LINES='DynamicUser=true'
+        fi
+
         cat > /etc/systemd/system/telecloud.service <<EOF
 [Unit]
 Description=Telecloud Go Service
@@ -431,10 +528,29 @@ After=network.target
 
 [Service]
 Type=simple
+$SERVICE_USER_LINES
 WorkingDirectory=$BASE_DIR
+EnvironmentFile=$BASE_DIR/.env
 ExecStart=$BASE_DIR/telecloud
 Restart=always
 RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=$BASE_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -450,9 +566,18 @@ After=network.target
 
 [Service]
 Type=simple
+DynamicUser=true
 ExecStart=$(command -v cloudflared) tunnel run --url http://localhost:$APP_PORT $TUNNEL_NAME
 Restart=always
 RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

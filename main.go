@@ -123,6 +123,15 @@ func main() {
 	if err := database.InitDB(cfg.DatabaseDriver, cfg.DatabasePath, cfg.DatabaseDSN); err != nil {
 		fatalf("%v", err)
 	}
+
+	sqlitePath := ""
+	if cfg.DatabaseDriver == "" || cfg.DatabaseDriver == "sqlite" {
+		sqlitePath = cfg.DatabasePath
+	}
+	if err := database.MigrateEncryptV1(sqlitePath); err != nil {
+		fatalf("Encryption migration failed: %v", err)
+	}
+
 	cfg.LoadFromDB(database.GetSetting)
 
 	if *resetPassFlag {
@@ -217,14 +226,34 @@ func main() {
 
 	router := api.SetupRouter(cfg, webFS, startTG, restartApp)
 
-	httpServer := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: router,
+	adminUser := database.GetSetting("admin_username")
+
+	listenAddr := cfg.ListenAddr
+	if listenAddr == "" {
+		// Pre-setup we bind to loopback only so the open /setup endpoint can't
+		// be reached by random scanners on the public IP.
+		if adminUser == "" {
+			listenAddr = "127.0.0.1"
+			log.Println("Setup not finished — binding to 127.0.0.1 only. Set LISTEN_ADDR=0.0.0.0 to override.")
+		} else {
+			listenAddr = "0.0.0.0"
+		}
 	}
 
-	adminUser := database.GetSetting("admin_username")
+	httpServer := &http.Server{
+		Addr:    listenAddr + ":" + cfg.Port,
+		Handler: router,
+	}
 	if cfg.APIID == 0 || cfg.APIHash == "" || adminUser == "" {
-		setupURL := fmt.Sprintf("http://YOUR_IP_OR_DOMAIN:%s/setup", cfg.Port)
+		setupHost := listenAddr
+		if setupHost == "0.0.0.0" || setupHost == "::" {
+			setupHost = "YOUR_IP_OR_DOMAIN"
+		}
+		tokenSuffix := ""
+		if cfg.SetupToken != "" {
+			tokenSuffix = "?token=" + cfg.SetupToken
+		}
+		setupURL := fmt.Sprintf("http://%s:%s/setup%s", setupHost, cfg.Port, tokenSuffix)
 		log.Printf("Setup is incomplete. Starting in Setup Mode. Please visit: %s", setupURL)
 		log.Println("Starting TeleCloud on port " + cfg.Port + "...")
 	} else {

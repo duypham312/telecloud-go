@@ -93,6 +93,34 @@ pkg_install() {
     esac
 }
 
+# Verify a file's SHA256. Returns 0 on match, 1 on mismatch.
+# Usage: verify_sha256 <file_path> <expected_sha256_hex>
+verify_sha256() {
+    local file="$1"
+    local expected="$2"
+    if [ -z "$expected" ]; then
+        echo "[!] No expected SHA256 supplied for $file — skipping verification."
+        return 1
+    fi
+    local actual=""
+    if command -v sha256sum &>/dev/null; then
+        actual=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        echo "[!] Neither sha256sum nor shasum available — cannot verify checksum."
+        return 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+        echo "[!] CHECKSUM MISMATCH for $file"
+        echo "    Expected: $expected"
+        echo "    Got     : $actual"
+        return 1
+    fi
+    echo "[✓] SHA256 verified for $(basename "$file")"
+    return 0
+}
+
 # File download function with wget/curl fallback and retry
 download_file() {
     local url="$1"
@@ -333,6 +361,31 @@ download_telecloud() {
 
     echo "[+] Downloading version $VERSION..."
     download_file "$URL" telecloud.tar.gz || return 1
+
+    # Verify checksums.txt (generated automatically by GoReleaser).
+    CHECKSUMS_URL=$(echo "$API_DATA" | jq -r '.assets[] | select(.name == "checksums.txt") | .browser_download_url' | head -n 1)
+    if [ -n "$CHECKSUMS_URL" ] && [ "$CHECKSUMS_URL" != "null" ]; then
+        download_file "$CHECKSUMS_URL" telecloud-checksums.txt || {
+            echo "[!] Could not download checksums.txt — REFUSING to install to avoid spoofed binary."
+            rm -f telecloud.tar.gz
+            return 1
+        }
+        EXPECTED_SHA=$(grep "$(basename "$URL")" telecloud-checksums.txt | awk '{print $1}' | head -n 1)
+        if ! verify_sha256 telecloud.tar.gz "$EXPECTED_SHA"; then
+            echo "[!] Refusing to install — checksum mismatch."
+            rm -f telecloud.tar.gz telecloud-checksums.txt
+            return 1
+        fi
+        rm -f telecloud-checksums.txt
+    else
+        echo "[!] WARNING: release $VERSION does not publish checksums.txt — binary cannot be verified."
+        read -p "[?] Continue anyway? (y/n): " confirm_no_sum
+        if [ "$confirm_no_sum" != "y" ]; then
+            rm -f telecloud.tar.gz
+            return 1
+        fi
+    fi
+
     mkdir -p "$BASE_DIR"
     tar -xzf telecloud.tar.gz -C "$BASE_DIR" || { echo "[!] Extraction failed!"; return 1; }
 
@@ -348,6 +401,19 @@ download_telecloud() {
 # =============================
 # 4. CONFIGURE .ENV
 # =============================
+gen_random_hex() {
+    local len="${1:-32}"
+    if command -v openssl &>/dev/null; then
+        openssl rand -hex "$len"
+    elif [ -r /dev/urandom ]; then
+        LC_ALL=C tr -dc '0-9a-f' < /dev/urandom | head -c $((len * 2))
+        echo
+    else
+        echo "[!] Neither openssl nor /dev/urandom is available for random key generation."
+        return 1
+    fi
+}
+
 create_env() {
     if [ ! -f "$BASE_DIR/.env" ]; then
         echo "[+] Setting up .env configuration..."
@@ -355,10 +421,16 @@ create_env() {
         read -p "PORT [Default 8091]: " PORT
         PORT=${PORT:-8091}
 
+        MASTER_KEY=$(gen_random_hex 32) || return 1
+        SETUP_TOKEN=$(gen_random_hex 16) || return 1
+
         cat > "$BASE_DIR/.env" <<EOF
 PORT=$PORT
+LISTEN_ADDR=127.0.0.1
+TELECLOUD_MASTER_KEY=$MASTER_KEY
+TELECLOUD_SETUP_TOKEN=$SETUP_TOKEN
 EOF
-        
+
         if command -v ffmpeg &> /dev/null; then
             echo "FFMPEG_PATH=ffmpeg" >> "$BASE_DIR/.env"
         else
@@ -379,6 +451,18 @@ EOF
 
         chmod 600 "$BASE_DIR/.env"
         echo "✅ .env configuration saved"
+        echo ""
+        echo "=================================================================="
+        echo "⚠️  BACK UP THE MASTER KEY BELOW INTO YOUR PASSWORD MANAGER!"
+        echo "    Losing it means losing the ability to decrypt Telegram"
+        echo "    sessions and stored secrets."
+        echo "    TELECLOUD_MASTER_KEY=$MASTER_KEY"
+        echo "------------------------------------------------------------------"
+        echo "🔑 Open in your browser:"
+        echo "    http://127.0.0.1:$PORT/setup?token=$SETUP_TOKEN"
+        echo "    (token is single-use until admin is created)"
+        echo "=================================================================="
+        echo ""
     fi
 }
 
@@ -424,6 +508,19 @@ create_run_scripts() {
 
     # Create systemd service for Linux with systemd
     if [ "$OS_TYPE" == "linux" ] && command -v systemctl &>/dev/null; then
+        # Create a no-shell system user 'telecloud' to run the service (sandbox)
+        if ! getent passwd telecloud >/dev/null 2>&1; then
+            useradd --system --no-create-home --home-dir "$BASE_DIR" --shell /usr/sbin/nologin telecloud \
+                || useradd --system --no-create-home --home-dir "$BASE_DIR" --shell /bin/false telecloud \
+                || echo "[!] Could not create 'telecloud' user — service will fall back to DynamicUser."
+        fi
+        if getent passwd telecloud >/dev/null 2>&1; then
+            chown -R telecloud:telecloud "$BASE_DIR" 2>/dev/null || true
+            SERVICE_USER_LINES=$'User=telecloud\nGroup=telecloud'
+        else
+            SERVICE_USER_LINES='DynamicUser=true'
+        fi
+
         cat > /etc/systemd/system/telecloud.service <<EOF
 [Unit]
 Description=Telecloud Go Service
@@ -431,10 +528,29 @@ After=network.target
 
 [Service]
 Type=simple
+$SERVICE_USER_LINES
 WorkingDirectory=$BASE_DIR
+EnvironmentFile=$BASE_DIR/.env
 ExecStart=$BASE_DIR/telecloud
 Restart=always
 RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=$BASE_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -450,9 +566,18 @@ After=network.target
 
 [Service]
 Type=simple
+DynamicUser=true
 ExecStart=$(command -v cloudflared) tunnel run --url http://localhost:$APP_PORT $TUNNEL_NAME
 Restart=always
 RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

@@ -11,6 +11,8 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
+
+	"telecloud/utils"
 )
 
 // JoinPath joins path elements and ensures the result is a clean, absolute path starting with /.
@@ -826,17 +828,48 @@ func GetSetting(key string) string {
 	if err != nil {
 		return ""
 	}
+	if IsSensitiveSetting(key) {
+		plain, derr := utils.DecryptString(value)
+		if derr != nil {
+			return ""
+		}
+		return plain
+	}
+	return value
+}
+
+// GetSettingRaw returns the stored value without attempting decryption.
+// Used by the encryption auto-migration so it can detect legacy plaintext rows.
+func GetSettingRaw(key string) string {
+	var value string
+	query := "SELECT value FROM settings WHERE `key` = ?"
+	if IsPostgres() {
+		query = "SELECT value FROM settings WHERE \"key\" = ?"
+	} else if !IsMySQL() {
+		query = "SELECT value FROM settings WHERE key = ?"
+	}
+	if err := RODB.Get(&value, query, key); err != nil {
+		return ""
+	}
 	return value
 }
 
 func SetSetting(key string, value string) error {
+	stored := value
+	if IsSensitiveSetting(key) && value != "" && !utils.IsEncryptedString(value) {
+		enc, err := utils.EncryptString(value)
+		if err != nil {
+			return err
+		}
+		stored = enc
+	}
 	query := "INSERT INTO settings (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)"
 	if IsPostgres() {
 		query = "INSERT INTO settings (\"key\", value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value"
 	} else if !IsMySQL() {
 		query = "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
 	}
-	_, err := DB.Exec(query, key, value)
+	_, err := DB.Exec(query, key, stored)
 	return err
 }
 

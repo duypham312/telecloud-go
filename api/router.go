@@ -27,7 +27,7 @@ func SetupRouter(cfg *config.Config, contentFS fs.FS, startTG func(cfg *config.C
 	h := NewHandler(cfg, contentFS, startTG, restartApp)
 
 	r.Use(securityHeadersMiddleware())
-	r.Use(setupCheckMiddleware())
+	r.Use(setupCheckMiddleware(cfg.SetupToken))
 
 	// WebDAV Route
 	webdavH := gin.WrapH(webdav.NewHandler(cfg))

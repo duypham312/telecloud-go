@@ -33,6 +33,20 @@ func (h *Handler) handleGetLogin(c *gin.Context) {
 	})
 }
 
+// bumpAttempt records a failed authentication attempt against the given IP.
+// Shared by /login and /setup so a determined attacker can't trivially burn
+// attempts on one endpoint and switch to the other.
+func bumpAttempt(ip string) {
+	v, _ := loginAttempts.Load(ip)
+	var att loginAttempt
+	if v != nil {
+		att = v.(loginAttempt)
+	}
+	att.count++
+	att.last = time.Now()
+	loginAttempts.Store(ip, att)
+}
+
 func (h *Handler) handlePostLogin(c *gin.Context) {
 	ip := c.ClientIP()
 	val, _ := loginAttempts.Load(ip)

@@ -36,10 +36,22 @@ func (h *Handler) handlePostSetup(c *gin.Context) {
 		return
 	}
 
+	// Same per-IP rate limit as /login to slow down anyone who slips past the
+	// setup-token gate (e.g. local actors).
+	ip := c.ClientIP()
+	if v, _ := loginAttempts.Load(ip); v != nil {
+		att := v.(loginAttempt)
+		if att.count >= 5 && time.Since(att.last) < 15*time.Minute {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too_many_requests"})
+			return
+		}
+	}
+
 	username := c.PostForm("username")
 	password := c.PostForm("password")
 
 	if username == "" || password == "" {
+		bumpAttempt(ip)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password required"})
 		return
 	}
