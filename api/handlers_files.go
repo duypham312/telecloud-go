@@ -25,11 +25,8 @@ import (
 
 func (h *Handler) handleGetIndex(c *gin.Context) {
 	token, _ := c.Cookie("session_token")
-	var sessionUsername string
-	if token != "" {
-		database.RODB.Get(&sessionUsername, "SELECT username FROM sessions WHERE token = ?", token)
-	}
-	if token == "" || sessionUsername == "" {
+	sessionUsername := database.LookupSessionUser(token)
+	if sessionUsername == "" {
 		c.Redirect(http.StatusFound, "/login")
 		return
 	}
@@ -453,18 +450,10 @@ func (h *Handler) handlePostRemoteUploadCheck(c *gin.Context) {
 		return
 	}
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("too many redirects")
-			}
-			if utils.IsPrivateIP(req.URL.String()) {
-				return fmt.Errorf("forbidden_url")
-			}
-			return nil
-		},
-	}
+	// SafeHTTPClient re-resolves and rejects private/loopback IPs at dial
+	// time, defeating DNS-rebinding tricks the upfront IsPrivateIP check
+	// can't catch on its own.
+	client := utils.SafeHTTPClient(10 * time.Second)
 
 	req, err := http.NewRequestWithContext(c.Request.Context(), "HEAD", remoteURL, nil)
 	if err != nil {

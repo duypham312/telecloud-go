@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"rsc.io/qr"
 )
@@ -67,14 +66,14 @@ func (h *Handler) handlePostSetup(c *gin.Context) {
 	database.SetSetting("webdav_enabled", "false")
 
 	// Create session
-	sessionToken := uuid.New().String()
-	_, err = database.DB.Exec("INSERT INTO sessions (token, username) VALUES (?, ?)", sessionToken, username)
+	sessionToken, err := database.CreateSession(username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 		return
 	}
-	c.SetCookie("session_token", sessionToken, 3600*24*30, "/", "", isSecure(), true)
+	c.SetCookie("session_token", sessionToken, int(database.SessionTTL.Seconds()), "/", "", isSecure(), true)
 
+	database.LogAuditFromCtx(c, username, database.AuditActionSetupComplete, "", database.AuditStatusOK)
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 
@@ -95,6 +94,7 @@ func (h *Handler) handleSetupConfig(c *gin.Context) {
 	h.cfg.APIID = apiID
 	h.cfg.APIHash = apiHash
 
+	database.LogAuditFromCtx(c, database.GetSetting("admin_username"), database.AuditActionSetupConfig, "api_credentials", database.AuditStatusOK)
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 

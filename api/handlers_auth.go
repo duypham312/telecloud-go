@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -19,11 +18,8 @@ func (h *Handler) handleGetLogin(c *gin.Context) {
 	}
 
 	token, _ := c.Cookie("session_token")
-	var sessionUsername string
-	if token != "" {
-		database.RODB.Get(&sessionUsername, "SELECT username FROM sessions WHERE token = ?", token)
-	}
-	if token != "" && sessionUsername != "" {
+	sessionUsername := database.LookupSessionUser(token)
+	if sessionUsername != "" {
 		c.Redirect(http.StatusFound, "/")
 		return
 	}
@@ -87,13 +83,13 @@ func (h *Handler) handlePostLogin(c *gin.Context) {
 			return
 		}
 		loginAttempts.Delete(ip) // Reset on success
-		sessionToken := uuid.New().String()
-		_, err := database.DB.Exec("INSERT INTO sessions (token, username) VALUES (?, ?)", sessionToken, username)
+		sessionToken, err := database.CreateSession(username)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 			return
 		}
-		c.SetCookie("session_token", sessionToken, 3600*24*30, "/", "", isSecure(), true)
+		c.SetCookie("session_token", sessionToken, int(database.SessionTTL.Seconds()), "/", "", isSecure(), true)
+		database.LogAuditFromCtx(c, username, database.AuditActionLoginSuccess, "", database.AuditStatusOK)
 		c.JSON(http.StatusOK, gin.H{"status": "success"})
 		return
 	}
@@ -106,6 +102,7 @@ func (h *Handler) handlePostLogin(c *gin.Context) {
 	// Artificial delay to thwart fast scripts
 	time.Sleep(1 * time.Second)
 
+	database.LogAuditFromCtx(c, username, database.AuditActionLoginFail, "", database.AuditStatusDenied)
 	if att.count >= 5 {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "ip_blocked"})
 	} else {
@@ -115,11 +112,15 @@ func (h *Handler) handlePostLogin(c *gin.Context) {
 
 func (h *Handler) handleLogout(c *gin.Context) {
 	token, _ := c.Cookie("session_token")
+	actor := database.LookupSessionUser(token)
 	if token != "" {
 		database.DB.Exec("DELETE FROM sessions WHERE token = ?", token)
 	}
 	c.SetCookie("session_token", "", -1, "/", "", isSecure(), true)
 	c.SetCookie(csrfCookieName, "", -1, "/", "", isSecure(), false)
+	if actor != "" {
+		database.LogAuditFromCtx(c, actor, database.AuditActionLogout, "", database.AuditStatusOK)
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 
@@ -178,6 +179,7 @@ func (h *Handler) handlePostResetAdmin(c *gin.Context) {
 	if adminUser != "" {
 		database.DB.Exec("DELETE FROM sessions WHERE username = ?", adminUser)
 	}
+	database.LogAuditFromCtx(c, adminUser, database.AuditActionAdminReset, "", database.AuditStatusOK)
 
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }

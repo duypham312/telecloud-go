@@ -248,8 +248,18 @@ const sqliteSchema = `
 	CREATE TABLE IF NOT EXISTS sessions (
 		token TEXT PRIMARY KEY,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		username TEXT DEFAULT ''
+		username TEXT DEFAULT '',
+		expires_at DATETIME
 	);
+	CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+	CREATE TABLE IF NOT EXISTS share_sessions (
+		token TEXT PRIMARY KEY,
+		share_token TEXT NOT NULL,
+		expires_at DATETIME NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at);
 
 	CREATE TABLE IF NOT EXISTS tg_sessions (
 		session_id TEXT PRIMARY KEY,
@@ -312,6 +322,19 @@ const sqliteSchema = `
 		PRIMARY KEY (username, key)
 	);
 
+	CREATE TABLE IF NOT EXISTS audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts DATETIME NOT NULL,
+		actor TEXT,
+		action TEXT NOT NULL,
+		target TEXT,
+		status TEXT,
+		ip TEXT,
+		ua TEXT
+	);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor);
+
 	CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 	CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
 	CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename);
@@ -345,7 +368,17 @@ const mysqlSchema = `
 	CREATE TABLE IF NOT EXISTS sessions (
 		token VARCHAR(191) PRIMARY KEY,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		username VARCHAR(191) DEFAULT ''
+		username VARCHAR(191) DEFAULT '',
+		expires_at DATETIME,
+		INDEX idx_sessions_expires (expires_at)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+	CREATE TABLE IF NOT EXISTS share_sessions (
+		token VARCHAR(191) PRIMARY KEY,
+		share_token VARCHAR(191) NOT NULL,
+		expires_at DATETIME NOT NULL,
+		INDEX idx_share_sessions_share (share_token),
+		INDEX idx_share_sessions_expires (expires_at)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 	CREATE TABLE IF NOT EXISTS tg_sessions (
@@ -413,6 +446,19 @@ const mysqlSchema = `
 		value TEXT NOT NULL,
 		PRIMARY KEY (username, ` + "`key`" + `)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+	CREATE TABLE IF NOT EXISTS audit_log (
+		id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		ts DATETIME NOT NULL,
+		actor VARCHAR(191),
+		action VARCHAR(64) NOT NULL,
+		target VARCHAR(384),
+		status VARCHAR(32),
+		ip VARCHAR(64),
+		ua VARCHAR(512),
+		INDEX idx_audit_log_ts (ts),
+		INDEX idx_audit_log_actor (actor)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 `
 
 const postgresSchema = `
@@ -440,8 +486,18 @@ const postgresSchema = `
 	CREATE TABLE IF NOT EXISTS sessions (
 		token TEXT PRIMARY KEY,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		username TEXT DEFAULT ''
+		username TEXT DEFAULT '',
+		expires_at TIMESTAMP
 	);
+	CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+	CREATE TABLE IF NOT EXISTS share_sessions (
+		token TEXT PRIMARY KEY,
+		share_token TEXT NOT NULL,
+		expires_at TIMESTAMP NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at);
 
 	CREATE TABLE IF NOT EXISTS tg_sessions (
 		session_id TEXT PRIMARY KEY,
@@ -508,6 +564,19 @@ const postgresSchema = `
 		PRIMARY KEY (username, key)
 	);
 
+	CREATE TABLE IF NOT EXISTS audit_log (
+		id BIGSERIAL PRIMARY KEY,
+		ts TIMESTAMP NOT NULL,
+		actor TEXT,
+		action TEXT NOT NULL,
+		target TEXT,
+		status TEXT,
+		ip TEXT,
+		ua TEXT
+	);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor);
+
 	CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
 	CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
 	CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename);
@@ -542,6 +611,16 @@ func migrateSQLite() error {
 	DB.Exec("ALTER TABLE upload_tasks ADD COLUMN overwrite BOOLEAN DEFAULT 0")
 	DB.Exec("ALTER TABLE files ADD COLUMN deleted_at DATETIME")
 	DB.Exec("ALTER TABLE files ADD COLUMN share_password TEXT")
+	// Sessions get an explicit expiry column so we can stop trusting tokens
+	// older than 30 days, even if the cookie was somehow retained.
+	DB.Exec("ALTER TABLE sessions ADD COLUMN expires_at DATETIME")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
+	// Backfill: assume any pre-existing row has 30 days from its created_at.
+	DB.Exec("UPDATE sessions SET expires_at = datetime(created_at, '+30 days') WHERE expires_at IS NULL")
+	// New share-session table (used by password-protected share links).
+	DB.Exec("CREATE TABLE IF NOT EXISTS share_sessions (token TEXT PRIMARY KEY, share_token TEXT NOT NULL, expires_at DATETIME NOT NULL)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at)")
 	// Ensure foreign keys are enabled
 	DB.Exec("PRAGMA foreign_keys = ON")
 	return nil
@@ -651,6 +730,16 @@ func migrateMySQL() error {
 	if err := alterTableMySQL("files", "ADD COLUMN share_password TEXT"); err != nil {
 		return err
 	}
+	if err := alterTableMySQL("sessions", "ADD COLUMN expires_at DATETIME"); err != nil {
+		return err
+	}
+	if err := createIndexMySQL("idx_sessions_expires", "sessions", "expires_at", false); err != nil {
+		return err
+	}
+	DB.Exec("UPDATE sessions SET expires_at = DATE_ADD(created_at, INTERVAL 30 DAY) WHERE expires_at IS NULL")
+	if _, err := DB.Exec("CREATE TABLE IF NOT EXISTS share_sessions (token VARCHAR(191) PRIMARY KEY, share_token VARCHAR(191) NOT NULL, expires_at DATETIME NOT NULL, INDEX idx_share_sessions_share (share_token), INDEX idx_share_sessions_expires (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
+		return err
+	}
 
 	// Create user_settings if not exists (already in schema but for migration)
 	if _, err := DB.Exec("CREATE TABLE IF NOT EXISTS user_settings (username VARCHAR(191) NOT NULL, `key` VARCHAR(191) NOT NULL, value TEXT NOT NULL, PRIMARY KEY (username, `key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
@@ -664,6 +753,12 @@ func migratePostgres() error {
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)")
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename)")
+	DB.Exec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
+	DB.Exec("UPDATE sessions SET expires_at = created_at + INTERVAL '30 days' WHERE expires_at IS NULL")
+	DB.Exec(`CREATE TABLE IF NOT EXISTS share_sessions (token TEXT PRIMARY KEY, share_token TEXT NOT NULL, expires_at TIMESTAMP NOT NULL)`)
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at)")
 	_, err := DB.Exec(`
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_active_files
 		ON files (path, filename, owner)

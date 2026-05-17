@@ -7,6 +7,7 @@ import (
 	"strings"
 	"telecloud/database"
 	"telecloud/utils"
+	"telecloud/webdav"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -54,14 +55,22 @@ func (h *Handler) handlePostPassword(c *gin.Context) {
 		database.DB.Exec("UPDATE child_accounts SET password_hash = ?, force_password_change = 0 WHERE username = ?", string(hashedPassword), username)
 	}
 
-	token, _ := c.Cookie("session_token")
-	if token == "" {
-		sessionToken := uuid.New().String()
-		_, err = database.DB.Exec("INSERT INTO sessions (token, username) VALUES (?, ?)", sessionToken, username)
+	currentToken, _ := c.Cookie("session_token")
+	if currentToken == "" {
+		sessionToken, err := database.CreateSession(username)
 		if err == nil {
-			c.SetCookie("session_token", sessionToken, 3600*24*30, "/", "", isSecure(), true)
+			c.SetCookie("session_token", sessionToken, int(database.SessionTTL.Seconds()), "/", "", isSecure(), true)
+			currentToken = sessionToken
 		}
 	}
+
+	// Force every OTHER device for this user to re-authenticate. The session
+	// the user is changing the password from is preserved so they don't
+	// log themselves out.
+	_ = database.DeleteOtherSessions(username, currentToken)
+	// Clear any cached WebDAV bcrypt result tied to the old password.
+	webdav.InvalidateCache(username)
+	database.LogAuditFromCtx(c, username, database.AuditActionPasswordChange, "", database.AuditStatusOK)
 
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
@@ -77,6 +86,7 @@ func (h *Handler) handlePostWebDAV(c *gin.Context) {
 	} else {
 		database.SetSetting("webdav_enabled", "false")
 	}
+	database.LogAuditFromCtx(c, c.GetString("username"), database.AuditActionWebDAVToggle, "enabled="+enabled, database.AuditStatusOK)
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 

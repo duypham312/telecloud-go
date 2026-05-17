@@ -171,12 +171,9 @@ func main() {
 			}
 		}
 	}
-	cryptoSecret := database.GetSetting("crypto_secret")
-	if cryptoSecret == "" {
-		cryptoSecret = uuid.New().String()
-		database.SetSetting("crypto_secret", cryptoSecret)
+	if err := utils.InitCrypto(); err != nil {
+		fatalf("%v", err)
 	}
-	utils.InitCrypto(cryptoSecret)
 	utils.InitMedia(cfg.ThumbsDir)
 
 	// Initialize WebAuthn (logic moved to api.InitWebAuthn for consistency)
@@ -184,6 +181,7 @@ func main() {
 
 	startCleanupTask(cfg)
 	startTrashCleanupTask(cfg)
+	startSessionCleanupTask()
 	// cancelCtx is used to signal the Telegram client to stop
 	appCtx, cancelApp := context.WithCancel(context.Background())
 	defer cancelApp()
@@ -429,6 +427,29 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// startSessionCleanupTask periodically deletes expired rows from the
+// sessions and share_sessions tables so they don't grow unbounded and so
+// stale tokens are evicted close to their actual expiry.
+func startSessionCleanupTask() {
+	go func() {
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		// Run once on boot to catch anything left over from the previous run.
+		runOnce := func() {
+			if s, sh := database.CleanupExpiredSessions(); s > 0 || sh > 0 {
+				log.Printf("[Sessions] cleaned %d expired session(s), %d expired share session(s)", s, sh)
+			}
+			if a := database.CleanupExpiredAudit(); a > 0 {
+				log.Printf("[Audit] purged %d audit row(s) older than retention horizon", a)
+			}
+		}
+		runOnce()
+		for range ticker.C {
+			runOnce()
+		}
+	}()
 }
 
 func startCleanupTask(cfg *config.Config) {

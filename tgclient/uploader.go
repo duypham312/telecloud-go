@@ -639,15 +639,49 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 		Resolver:  fallbackResolver,
 	}
 
+	// ssrfGuardedDial wraps a regular dialer with an explicit DNS resolve so we
+	// can reject any private/loopback IP at connect time. Without this a
+	// malicious DNS server could pass the pre-flight IsPrivateIP check and
+	// then rebind the host to 127.0.0.1 for the actual GET.
+	ssrfGuardedDial := func(d *net.Dialer, resolver *net.Resolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			if ip := net.ParseIP(host); ip != nil {
+				if utils.IsUnsafeIP(ip) {
+					return nil, fmt.Errorf("ssrf: refusing private IP %s", ip)
+				}
+				return d.DialContext(ctx, network, addr)
+			}
+			r := net.DefaultResolver
+			if resolver != nil {
+				r = resolver
+			}
+			ips, err := r.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range ips {
+				if utils.IsUnsafeIP(ip.IP) {
+					return nil, fmt.Errorf("ssrf: %s resolves to %s", host, ip.IP)
+				}
+			}
+			return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		}
+	}
+
 	client := &http.Client{
 		Timeout: 0, // No timeout for overall download, context handles cancellation
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := defaultDialer.DialContext(ctx, network, addr)
+				conn, err := ssrfGuardedDial(defaultDialer, nil)(ctx, network, addr)
 				if err != nil {
-					// Fallback to Cloudflare DNS if system resolver fails (very common on Termux)
-					return fallbackDialer.DialContext(ctx, network, addr)
+					// Fallback to Cloudflare DNS if system resolver fails (very common on Termux),
+					// still guarded against SSRF rebinding.
+					return ssrfGuardedDial(fallbackDialer, fallbackResolver)(ctx, network, addr)
 				}
 				return conn, nil
 			},
