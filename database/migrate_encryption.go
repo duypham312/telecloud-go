@@ -79,6 +79,21 @@ func MigrateEncryptV1(sqliteDBPath string) error {
 		return err
 	}
 
+	// Check whether there is anything to migrate at all. Fresh installs on
+	// MySQL/Postgres should not have to set TELECLOUD_I_HAVE_BACKED_UP just
+	// to record schema_version=1, and an already-encrypted DB should not
+	// trigger another backup either.
+	pending, err := hasPendingPlaintext()
+	if err != nil {
+		return fmt.Errorf("scan for plaintext rows: %w", err)
+	}
+	if !pending {
+		if err := setSchemaVersion("encryption", encryptionSchemaVersion); err != nil {
+			return fmt.Errorf("mark schema_version: %w", err)
+		}
+		return nil
+	}
+
 	if IsMySQL() || IsPostgres() {
 		if os.Getenv("TELECLOUD_I_HAVE_BACKED_UP") != "1" {
 			return fmt.Errorf("encryption migration needs a manual DB dump first; back up the database and set TELECLOUD_I_HAVE_BACKED_UP=1 to proceed")
@@ -100,6 +115,37 @@ func MigrateEncryptV1(sqliteDBPath string) error {
 		return fmt.Errorf("mark schema_version: %w", err)
 	}
 	return nil
+}
+
+// hasPendingPlaintext returns true if any row in tg_sessions or the
+// sensitive settings list is still stored as plaintext under the current
+// schema layout. The scan short-circuits at the first plaintext row found.
+func hasPendingPlaintext() (bool, error) {
+	for _, key := range SensitiveSettingKeys() {
+		raw := GetSettingRaw(key)
+		if raw != "" && !utils.IsEncryptedString(raw) {
+			return true, nil
+		}
+	}
+
+	rows, err := RODB.Query("SELECT data FROM tg_sessions")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return false, err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		if _, derr := utils.DecryptAEAD(data); derr != nil {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func backupSQLiteFile(dbPath string) error {

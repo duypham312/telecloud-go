@@ -429,6 +429,9 @@ PORT=$PORT
 LISTEN_ADDR=127.0.0.1
 TELECLOUD_MASTER_KEY=$MASTER_KEY
 TELECLOUD_SETUP_TOKEN=$SETUP_TOKEN
+# Khoá bootstrap-UI fallback: cài qua script này đã sinh sẵn key,
+# nên production nên fail-fast nếu env biến mất thay vì mở /bootstrap.
+TELECLOUD_REQUIRE_MASTER_KEY=1
 EOF
 
         if command -v ffmpeg &> /dev/null; then

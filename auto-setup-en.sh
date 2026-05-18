@@ -429,6 +429,10 @@ PORT=$PORT
 LISTEN_ADDR=127.0.0.1
 TELECLOUD_MASTER_KEY=$MASTER_KEY
 TELECLOUD_SETUP_TOKEN=$SETUP_TOKEN
+# Disable the bootstrap-UI fallback: this installer already generated a key,
+# so production should fail-fast if the env disappears instead of opening
+# /bootstrap.
+TELECLOUD_REQUIRE_MASTER_KEY=1
 EOF
 
         if command -v ffmpeg &> /dev/null; then

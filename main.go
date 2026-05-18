@@ -39,6 +39,7 @@ import (
 	"github.com/google/uuid"
 
 	"telecloud/api"
+	"telecloud/bootstrap"
 	"telecloud/config"
 	"telecloud/database"
 	"telecloud/tgclient"
@@ -124,6 +125,25 @@ func main() {
 		fatalf("%v", err)
 	}
 
+	// Sub-folder 'web' from the embedded FS, created early so the bootstrap
+	// UI (which runs before the main router) can parse its template.
+	webFS, err := fs.Sub(contentFS, "web")
+	if err != nil {
+		fatalf("Failed to create sub FS for web: %v", err)
+	}
+
+	// Make sure a master key is available. With env or a key file present
+	// this is a no-op; otherwise the bootstrap server walks the operator
+	// through generating/pasting a key. CLI maintenance flags can't show a
+	// web UI so they bail out early with a clear hint.
+	if *authFlag || *resetPassFlag {
+		if _, kerr := utils.LoadMasterKey(); kerr != nil {
+			fatalf("%v\nStart TeleCloud without flags first to configure the master key via the bootstrap UI, or set TELECLOUD_MASTER_KEY in your environment.", kerr)
+		}
+	} else if err := bootstrap.EnsureMasterKey(cfg, webFS); err != nil {
+		fatalf("%v", err)
+	}
+
 	sqlitePath := ""
 	if cfg.DatabaseDriver == "" || cfg.DatabaseDriver == "sqlite" {
 		sqlitePath = cfg.DatabasePath
@@ -194,12 +214,6 @@ func main() {
 
 	// Initialise the WebSocket hub with the app context so it shuts down gracefully
 	ws.InitHub(appCtx)
-
-	// Sub-folder 'web' from the embedded FS to keep paths clean
-	webFS, err := fs.Sub(contentFS, "web")
-	if err != nil {
-		fatalf("Failed to create sub FS for web: %v", err)
-	}
 
 	tgErrCh := make(chan error, 1)
 
